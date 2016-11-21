@@ -1,10 +1,10 @@
 ---
-title: "Stars and Statistics Final Project"
+title: "Stars and Statistics"
 author: "Brooke Fitzgerald"
 date: "12/2/2015"
 output: pdf_document
 ---
-For my final project, I wanted to examine the astronometric data on the Hyades star cluster from the Penn State Center for Astrostatistics website collected by the HIPPARCOS sattelite. This data contains six variables:
+I wanted to examine the astronometric data on the Hyades star cluster from the Penn State Center for Astrostatistics website collected by the HIPPARCOS sattelite. This data contains six variables:
 Vmag  =  Visual Band Magnitude (inverted logarithmic measure of brightness)
 RA    =  Right Ascension (celestial longitude)
 DE    =  Declination (celestial latitude )
