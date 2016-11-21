@@ -1,0 +1,342 @@
+---
+title: "Stars and Statistics Final Project"
+author: "Brooke Fitzgerald"
+date: "12/2/2015"
+output: pdf_document
+---
+For my final project, I wanted to examine the astronometric data on the Hyades star cluster from the Penn State Center for Astrostatistics website collected by the HIPPARCOS sattelite. This data contains six variables:
+Vmag  =  Visual Band Magnitude (inverted logarithmic measure of brightness)
+RA    =  Right Ascension (celestial longitude)
+DE    =  Declination (celestial latitude )
+Plx   =  Parallactic angle (milliarcseconds)
+pmRA  =  Proper motion in RA (mas/yr)
+pmDE  =  Proper motion in DE (mas/yr)
+e_Plx =  Measurement error in Plx (mas)
+B-V   =  Color of star (mag)
+
+Given the importance of the relationship between star brightness and star color in astrophysics as demonstrated by the Hertzsprung-Russell Diagram, I was intrigued by what factors would matter in predicting the Visual Band Magnitude. 
+
+After doing some initial dataset visualization and constructing my own version of the Hertzsprung-Russell Diagram, I used several linear and non-linear models to predicting Vmag, and then compared their RSS values.
+
+I then wanted to dive in deeper and use some unsupervised learning techniques to explore how the portions of the Hertzsprung-Russell Diagram that aren't from the main sequence of stars. I used three different clustering techniques, and the one that formed a cluster around the outliers came from a model-based clustering algorithm based on finite normal mixture modelling.
+
+I then added a factor to my dataset stating whether or not a point is from the outlier cluster and used various classification models to try and predict cluster membership, plotting their classification error at the end.
+
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE, echo=FALSE}
+library(ggplot2)
+library(caret)
+library(rockchalk)
+library(gpairs)
+library(cluster)
+library(mclust)
+library(HSAUR)
+library(fpc)
+library(matrixStats)
+library(glmnet)
+library(pls)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+library(gam)
+library(dplyr)
+library(leaps)
+library(e1071)
+library(adabag)
+```
+
+First, I visualized the data that I had, then removed all of the NA values and split the data into training and testing sets.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+star.data<-read.csv('HIP_star_NA.csv', stringsAsFactors=FALSE)
+
+gpairs(star.data)
+
+#This is how to get brightness from Vmag
+logL<-15 - star.data$Vmag - 5*log(star.data$Plx)/2.5 
+
+#Creating a Hertzsprung-Russell Diagram
+plot(star.data$B.V, logL, xlim = c(-.158, 2), xlab = 'B.V', ylab = 'V')
+
+#Removing the NAs
+clean.data<- star.data[complete.cases(star.data),]
+
+train.data <- clean.data[1:2410,   ]
+test.data  <- clean.data[2411:2678,]
+```
+
+Next, I predicted the visual band magnitude using linear regression.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+lin.fit <- lm(Vmag~., train.data)
+lin.preds <- predict(lin.fit, test.data)
+lin.RSS <- sum((test.data$Vmag-lin.preds)^2)
+```
+
+Next, I predicted the visual band magnitude using linear regression with the bootstrap (sampling with replacement and then averaging over all of the predictions from the sampled data).
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+boot.matrix <- matrix(nrow = 268)
+n = NROW(train.data)
+for (i in 1:500){
+  unifnum <- sample(c(1:n),n,replace = T)	# pick random indices with replacement
+  boot.fit <- lm(Vmag~., train.data[unifnum,])
+  boot.preds <- predict(boot.fit, test.data)
+  boot.matrix <- cbind(boot.matrix, boot.preds)
+}
+
+boot.avg.pred <- rowMeans(boot.matrix[,2:NCOL(boot.matrix)])
+boot.avg.RSS <- sum((test.data$Vmag-boot.avg.pred)^2)
+
+# Calculatinng variance between the predictions
+boot.pred.var <- mean(rowVars(boot.matrix[,2:NCOL(boot.matrix)]))
+boot.pred.var
+```
+The variance is extremely low, suggesting that there is not a large amount of variance within our dataset, which makes sense because the Hyades dataset is a subset of the entire HIPPARCOS catalog of stars that are likely to be in the Hyades star cluster.
+
+Next, I predicted the visual band magnitude using best subset selection.
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+best.subset <- regsubsets(Vmag~.,test.data)
+sub.RSS <- NULL
+for (i in 1:7){
+  curr.model.names <- c(names(coef(best.subset, i)), "Vmag")
+  
+  curr.train.data <- train.data[, curr.model.names[2:(i+2)]]
+  curr.test.data <- test.data[, curr.model.names[2:(i+2)]]
+  
+  sub.preds<- predict(lm(Vmag~.,curr.train.data), curr.test.data)
+  sub.RSS[i] <- sum((sub.preds - curr.test.data$Vmag)^2)
+}
+
+which.min(sub.RSS)
+```
+Interestingly, only using two features (the color of a star (B.V) and the error in measuring the star's parallax e_Plx) actually gives you a better cross-validated RSS then using all of the features. This also allowed me to plot the data in 3-dimensions with the regression plane.
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+best.3D <- mcGraph3(test.data$Vmag, test.data$e_Plx, test.data$B.V, main="Best Subset Predicting Brightness")
+```
+
+Next, I predicted the visual band magnitude using lasso and ridge regression.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+y.train <- train.data$Vmag
+x.train <- model.matrix(Vmag ~., train.data)  
+
+y.test <- test.data$Vmag
+x.test <- model.matrix(Vmag ~., test.data)
+
+grid <- 10^seq(-5, -1, length = 1000)
+
+ridge.fit<-glmnet(x.train, y.train, alpha=0, lambda=grid)
+lasso.fit<-glmnet(x.train, y.train, alpha=1, lambda=grid)
+
+ridge.RSS <- NULL
+lasso.RSS <- NULL
+for (i in 1:1000){
+  ridge.preds<-predict(ridge.fit, s = grid[i], newx = x.test)
+  lasso.preds<-predict(lasso.fit, s = grid[i], newx = x.test)
+  ridge.RSS[i] <- sum((ridge.preds - y.test)^2)
+  lasso.RSS[i] <- sum((lasso.preds - y.test)^2)
+}
+grid[which.min(ridge.RSS)]
+grid[which.min(lasso.RSS)]
+```
+Another interesting finding is that the cost that gives the minimum RSS value is 1 e^-5 for ridge regression and .0319 for the lasso. This also makes sense because if the best subset only uses 2 variables, and since increasing the cost parameter for the lasso pushes weights to 0, it makes sense that a large cost would have a smaller RSS.
+
+Next, I moved on to non-linear predictions and predicted the visual band magnitude using principal component regression and partial least squares.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+pcr.fit <- pcr(Vmag~., data=train.data, scale=TRUE, validation ="CV")
+pcr.pred <- predict(pcr.fit, test.data)
+pcr.RSS <- sum((pcr.pred-test.data$Vmag)^2)
+validationplot(pcr.fit, val.type = 'R2', ylab = 'R^2', xlab = 'Number of Components', main = 'Variance in Data Explained by PCR')
+
+pls.fit <- plsr(Vmag~., data=train.data, scale=TRUE, validation ="CV")
+pls.pred <- predict(pls.fit, test.data)
+pls.RSS <- sum((pls.pred-test.data$Vmag)^2)
+validationplot(pls.fit, val.type = 'R2', ylab = 'R^2', xlab = 'Number of Components', main = 'Variance in Vmag Explained by PLS')
+```
+These methods seem extremely ineffective and preform extremely poorly. This is probably because there aren't enough variables to for these dimensionality reductors to work as they're intended.
+
+Next, I created a generalized additive model by constructing a formula through trial and error that a) was stastically significant and b) reduced the cross-validated RSS.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+gam.fit <- gam(Vmag~pmDE + DE*RA + s(B.V,8) + ns(e_Plx,4), data=train.data)
+gam.pred <- predict(gam.fit, test.data)
+gam.RSS <- sum((gam.pred-test.data$Vmag)^2)
+summary(gam.fit)
+```
+
+Then I used decision trees, bagging, random forests, and boosting to predict Vmag.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+tree.fit <- rpart(Vmag~., train.data)
+tree.pred <- predict(tree.fit, test.data)
+tree.RSS <- sum((tree.pred-test.data$Vmag)^2)
+prp(tree.fit)
+
+bag.fit <- randomForest(Vmag~.,train.data, mtry=7, importance =TRUE)
+bag.pred <- predict(bag.fit, test.data)
+bag.RSS <- sum((bag.pred-test.data$Vmag)^2)
+
+varImpPlot(bag.fit)
+
+rf.fit <- randomForest(Vmag~., train.data, importance =TRUE)
+rf.pred <- predict(rf.fit, test.data)
+rf.RSS <- sum((rf.pred-test.data$Vmag)^2)
+
+varImpPlot(rf.fit)
+
+set.seed(1)
+boost.fit <- gbm(Vmag~., train.data, distribution="gaussian", n.trees=5000, interaction.depth=4)
+boost.pred <- predict(boost.fit, test.data, n.trees = 5000)
+boost.RSS <- sum((boost.pred-test.data$Vmag)^2)
+
+summary(boost.fit)
+
+old.par<-par(no.readonly = T)
+par(mfrow=c(2,1), mar = rep(2.5, 4))
+plot(boost.fit, i.var = 'e_Plx')
+mtext('e_Plx', side = 1, padj = 3.5)
+mtext('Vmag Prediction', side = 2, padj = -2.8)
+plot(boost.fit, i.var = 'B.V')
+mtext('B.V', side = 1, padj = 2.7)
+mtext('Vmag Prediction', side = 2, padj = -2.8)
+```
+As you can see, the only variables that really matter in any of these model in predicting a star's visual magnitude are color (B.V) and the parallax measurement error (e_Plx).
+
+Then I plotted and compared all of the cross-validated RSS values from each model.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE, echo=FALSE}
+par(old.par)
+total.RSS <- c(lin.RSS, boot.avg.RSS, min(sub.RSS), min(lasso.RSS), min(ridge.RSS), pcr.RSS, pls.RSS, gam.RSS, tree.RSS, bag.RSS, rf.RSS, boost.RSS)
+model.names <- c('linear', 'bootstrap', 'best subset', 'lasso', 'ridge', 'PCR', 'PLS', 'GAM', 'tree', 'bagging', 'random forest', 'boosting')
+names(total.RSS)<-model.names
+
+zoom.RSS <- c(lin.RSS, boot.avg.RSS, min(sub.RSS), min(lasso.RSS), min(ridge.RSS), gam.RSS, tree.RSS, bag.RSS, rf.RSS, boost.RSS)
+zoom.names <- c('linear', 'bootstrap', 'best subset', 'lasso', 'ridge', 'GAM', 'tree', 'bagging', 'random forest', 'boosting')
+names(zoom.RSS)<- zoom.names
+total.colors <- c("black", "blue", 'red', 'blueviolet', 'green', 'orange', 'darkorchid', 'magenta', 'brown', 'deepskyblue4', 'darkgrey', "firebrick")
+
+total.RSS
+
+plot(total.RSS, xlab = 'Prediction Methods', ylab = 'RSS',col=total.colors, pch = 15, main = 'All Predictions')
+legend(10,2950, model.names, pch = 15,col=total.colors, cex = .55)
+
+plot(zoom.RSS, xlab = 'Prediction Methods', ylab = 'RSS',col=total.colors, pch = 15, main = 'Subset of Predictions')
+legend(8.6,300, zoom.names, pch = 15,col=total.colors[1:10], cex = .55)
+```
+
+Then, I used kmeans, hierarchical, and model-based clustering to try and distinguish the stars that aren't in the main sequence. I kept the kmeans and hierarchical clustering with three classes because more classes still didn't cluster how I wanted, because it's easier to see what's going on, and I ran the pamk function with my clean.data and it said that 3 classes is the optimal number for k-means clustering. 
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+km.clust<-kmeans(x=clean.data, 3, nstart =100)
+pairs(clean.data, col= km.clust$cluster, main = 'K-Means Clustering')
+clusplot(clean.data, km.clust$cluster, color=TRUE, shade=TRUE, labels=2, lines=0)
+
+plot(clean.data$B.V, clean.data$Vmag,xlim = c(-.158, 2), xlab = 'B.V', ylab = 'V', col=km.clust$cluster, main = 'K-Means Clustering',pch = 20)
+
+d <- dist(clean.data, method = "euclidean") # distance matrix
+hclust.fit <- hclust(d, method="ward.D") 
+plot(hclust.fit) # display dendogram
+hclust.groups <- cutree(hclust.fit, k=3)
+pairs(clean.data, col= hclust.groups,  main = 'Hierarchical Cluster')
+plot(clean.data$B.V, clean.data$Vmag,xlim = c(-.158, 2), xlab = 'B.V', ylab = 'V', col=hclust.groups, main = 'Hierarchical Cluster',pch = 20)
+clusplot(clean.data, hclust.groups, color=TRUE, shade=TRUE, labels=2, lines=0)
+
+set.seed(1)
+mclust.fit <- Mclust(clean.data)
+plot(mclust.fit, main = 'Model-Based Cluster')
+plot(clean.data$B.V, clean.data$Vmag,xlim = c(-.158, 2), xlab = 'B.V', ylab = 'V', col=mclust.fit$classification, main = 'Model-Based Cluster', pch = 20)
+mclust.dr<-MclustDR(mclust.fit)
+plot(mclust.dr, what = "boundaries", ngrid = 200)
+```
+As you can see, the model-based clustering is the only method that differentiated stars from the main sequence.
+
+As such, I added all of the points that fit into that cluster as a factor to the data frame and split that data into testing and training sets.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+clean.data$outliers <- as.factor((mclust.fit$classification == 4)*1)
+plot(clean.data$B.V, clean.data$Vmag,xlim = c(-.158, 2), xlab = 'B.V', ylab = 'V', col=clean.data$outliers, main = 'Red Giants/Outlier Cluster')
+
+train.data <- clean.data[1:2410,   ]
+test.data  <- clean.data[2411:2678,]
+```
+
+Then I predicted cluster membership using support vector machines. 
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+cost<-10^(-5:3)
+
+svm.accuracy<-NULL
+
+for (i in 1:length(cost)){
+  svm.fit<-svm(outliers~., data=train.data, kernel ="linear", cost=cost[i], scale=FALSE)
+  svm.pred<- predict(svm.fit, test.data)
+  
+  svm.cm<-confusionMatrix(table(predict=svm.pred, truth=test.data$outliers))
+  accuracy<-Vectorize(svm.cm$overall)
+  svm.accuracy[i]<- accuracy[1]
+}
+
+svm.acc <- min(svm.accuracy)
+```
+
+Next, I used a classification tree, bagging, a random forest, and boosting to predict cluster membership.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+tree.fit <- rpart(outliers~., train.data, method = 'class')
+tree.pred <- (predict(tree.fit, test.data)[,1] < .95)*1
+tree.cm <- confusionMatrix(table(predict=tree.pred, truth=test.data$outliers))
+accuracy <- Vectorize(tree.cm$overall)
+tree.acc <- accuracy[1]
+prp(tree.fit)
+
+bag.fit <- randomForest(outliers~.,train.data, mtry=7, importance =TRUE)
+bag.pred <- predict(bag.fit, test.data)
+bag.cm <- confusionMatrix(table(predict=bag.pred, truth=test.data$outliers))
+accuracy <- Vectorize(bag.cm$overall)
+bag.acc <- accuracy[1]
+
+varImpPlot(bag.fit)
+
+rf.fit <- randomForest(outliers~., train.data, importance =TRUE)
+rf.pred <- predict(rf.fit, test.data)
+rf.cm <- confusionMatrix(table(predict=rf.pred, truth=test.data$outliers))
+accuracy <- Vectorize(rf.cm$overall)
+rf.acc <- accuracy[1]
+
+varImpPlot(rf.fit)
+
+set.seed(1)
+boost.fit <- boosting(outliers~., train.data, mfinal = 100)
+boost.pred <- predict(boost.fit, test.data)
+boost.cm <- confusionMatrix(table(predict=boost.pred$class, truth=test.data$outliers))
+accuracy <- Vectorize(boost.cm$overall)
+boost.acc <- accuracy[1]
+
+importanceplot(boost.fit)
+```
+
+Finally, I plotted the accuraccies of the classification data.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+total.acc <- c(svm.acc, tree.acc, bag.acc, rf.acc, boost.acc)
+model.names <- c('support vector machine', 'tree', 'bagging', 'random forest', 'boosting')
+names(total.acc)<-model.names
+
+zoom.acc <- c(tree.acc, bag.acc, rf.acc, boost.acc)
+names(zoom.acc)<-model.names[2:5]
+
+total.acc
+
+plot(total.acc, xlab = 'Classification Methods', ylab = 'RSS',col=total.colors, pch = 15, main = 'All Classification Accuracies')
+legend(3.6, .95, model.names, pch = 15,col=total.colors, cex = .7)
+
+plot(zoom.acc, xlab = 'Classification Methods', ylab = 'RSS',col=total.colors[2:5], pch = 15, main = 'Subset of Classifications')
+legend(3.3, .995, names(zoom.acc), pch = 15,col=total.colors[2:5], cex = .7)
+```
+
+I think that some of the most interesting findings to come out of this project are both the vast disparities in predictive accuracy between certain models (especially PLS and PCA, but also the linear models) and also the similarities between their output (the linear models and bagging and boosting all had almost identical RSS values) and variable use, as all of the predictions isolated B.V and e_Plx as being the most important variables. 
+
+Another interesting finding of this analysis is that while Vmag is almost solely predicted by B.V and e_Plx, membership in the outlier cluster is determined by many more of the variables. As was pointed out during my presentation, because cluster membership was determined by an algorithm, zll the predictions are doing is describing an algorithm. However, since the seperation of the red giant stars from the main sequence is an established astronomical fact, I still think that the importance of the other variables speaks to the nature of the actual stars in that cluster (a.k.a. red giants and supergiants).
